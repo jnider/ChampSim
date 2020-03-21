@@ -9,21 +9,29 @@ algorithms can be measured.
 
 #include "cache.h"
 #include "ooo_cpu.h"
-#include <unordered_map>
+#include "wiredtiger.h"
 
-/* array of instruction indices in the trace (i.e. timestamp) for
-   a given address */
-typedef std::vector<uint64_t> access_vector;
-
-/* hash of all memory addresses ever accessed */
-typedef std::unordered_map<uint64_t, access_vector> mem_map;
-mem_map memory_accesses;
-
-static void insert(uint64_t addr, uint64_t timestamp)
+// insert a value
+static void insert(WT_SESSION *session, char *table, uint64_t addr, uint64_t timestamp)
 {
+	WT_CURSOR *cursor;
+	int ret;
+	char key[24];
+	char value[24];
+
 	//printf("Inserting 0x%lx %lu\n", addr, timestamp);
-	access_vector& v = memory_accesses[addr];
-	v.push_back(timestamp);
+	ret = session->open_cursor(session, table, NULL, NULL, &cursor);
+	if (ret != 0)
+	{
+		printf("Error opening cursor during insert\n");
+		return;
+	}
+	snprintf(key, 24, "%lu", addr);
+	snprintf(value, 24, "%lu", timestamp);
+	cursor->set_key(cursor, key);
+	cursor->set_value(cursor, value);
+	cursor->insert(cursor);
+	cursor->close(cursor);
 }
 
 // initialize replacement state
@@ -31,12 +39,40 @@ void CACHE::llc_initialize_replacement()
 {
 	input_instr in;
 	long unsigned int ins=0;
+	long unsigned int loads=0;
+	long unsigned int stores=0;
+
+	WT_CONNECTION *conn;
+	WT_SESSION *session;
+
+	char home[] = "/home/joel/projects/ChampSim/db";
+
+	/* Open a connection to the database, creating it if necessary. */
+	printf("Opening db at %s\n", home);
+	if (wiredtiger_open(home, NULL, "create", &conn) != 0)
+	{
+		printf("Error opening db\n");
+		return;
+	}
+
+	printf("Opening session\n");
+	if (conn->open_session(conn, NULL, NULL, &session) != 0)
+	{
+		printf("Error opening session\n");
+		return;
+	}
+
+	// create a table
+	char table_name[1024];
+	snprintf(table_name, 127, "table:%s", "gamess");
+	int ret = session->create(session, table_name, "key_format=S,value_format=S");
+	if (ret != 0)
+	{
+		printf("error creating session for table %s\n", table_name);
+		return;
+	}
 
 	// create a record of all memory accesses in the whole trace for each CPU
-        //ooo_cpu[i].warmup_instructions = warmup_instructions;
-        //ooo_cpu[i].simulation_instructions = simulation_instructions;
-
-	printf("Printf is ok!\n");
 	printf("Skipping %lu warmup instructions\n", ooo_cpu[0].warmup_instructions);
 	while (fread(&in, sizeof(in), 1, ooo_cpu[0].trace_file))
 	{
@@ -53,7 +89,8 @@ void CACHE::llc_initialize_replacement()
 			if (in.source_memory[s])
 			{
 				//printf("%i:   LOAD <- 0x%lx\n", i, in.source_memory[s]);
-				insert(in.source_memory[s], ins);
+				insert(session, table_name, in.source_memory[s], ins);
+				loads++;
 			}
 		}
 
@@ -62,7 +99,8 @@ void CACHE::llc_initialize_replacement()
 			if (in.destination_memory[d])
 			{
 				//printf("%i:   STORE -> 0x%lx\n", i, in.destination_memory[d]);
-				insert(in.destination_memory[d], ins);
+				insert(session, table_name, in.destination_memory[d], ins);
+				stores++;
 			}
 		}
 
@@ -75,6 +113,7 @@ void CACHE::llc_initialize_replacement()
 	// rewind the file pointer
 	fseek(ooo_cpu[0].trace_file, 0L, SEEK_SET);
 
+	printf("Saw %lu loads and %lu stores\n", loads, stores);
 /*
 	// dump the map
 	printf("Dump\n");

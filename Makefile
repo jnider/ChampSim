@@ -8,11 +8,12 @@ inc = inc
 
 debug = 1
 
+WT_ROOT=/home/joel/projects/wiredtiger
+
 CFlags = -Wall -O3 -std=c++11
-LDFlags =
+LDFlags = $(WT_ROOT)/.libs/libwiredtiger.so
 libs =
 libDir =
-
 
 #************************ DO NOT EDIT BELOW THIS LINE! ************************
 
