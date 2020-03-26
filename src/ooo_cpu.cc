@@ -723,76 +723,62 @@ void O3_CPU::fetch_instruction()
 
 void O3_CPU::decode_and_dispatch()
 {
-  // dispatch DECODE_WIDTH instructions that have decoded into the ROB
-  uint32_t count_dispatches = 0;
-  for(uint32_t i=0; i<DECODE_BUFFER.SIZE; i++)
-    {
-      if(DECODE_BUFFER.entry[DECODE_BUFFER.head].ip == 0)
+	// dispatch DECODE_WIDTH instructions that have decoded into the ROB
+	uint32_t count_dispatches = 0;
+	for(uint32_t i=0; i<DECODE_BUFFER.SIZE; i++)
 	{
-	  break;
-	}
-      
-      if(((!warmup_complete[cpu]) && (ROB.occupancy < ROB.SIZE)) ||
-	 ((DECODE_BUFFER.entry[DECODE_BUFFER.head].event_cycle != 0) && (DECODE_BUFFER.entry[DECODE_BUFFER.head].event_cycle < current_core_cycle[cpu]) && (ROB.occupancy < ROB.SIZE)))
-	{
-	  // move this instruction to the ROB if there's space
-	  uint32_t rob_index = add_to_rob(&DECODE_BUFFER.entry[DECODE_BUFFER.head]);
-	  ROB.entry[rob_index].event_cycle = current_core_cycle[cpu];
+		if(DECODE_BUFFER.entry[DECODE_BUFFER.head].ip == 0)
+			break;
+ 
+		if(((!warmup_complete[cpu]) && (ROB.occupancy < ROB.SIZE)) ||
+			((DECODE_BUFFER.entry[DECODE_BUFFER.head].event_cycle != 0) &&
+			(DECODE_BUFFER.entry[DECODE_BUFFER.head].event_cycle < current_core_cycle[cpu]) &&
+			(ROB.occupancy < ROB.SIZE)))
+		{
+			// move this instruction to the ROB if there's space
+			uint32_t rob_index = add_to_rob(&DECODE_BUFFER.entry[DECODE_BUFFER.head]);
+			ROB.entry[rob_index].event_cycle = current_core_cycle[cpu];
 
-	  ooo_model_instr empty_entry;
-	  DECODE_BUFFER.entry[DECODE_BUFFER.head] = empty_entry;
-	  
-	  DECODE_BUFFER.head++;
-	  if(DECODE_BUFFER.head >= DECODE_BUFFER.SIZE)
-	    {
-	      DECODE_BUFFER.head = 0;
-	    }
-	  DECODE_BUFFER.occupancy--;
+			ooo_model_instr empty_entry;
+			DECODE_BUFFER.entry[DECODE_BUFFER.head] = empty_entry;
+			DECODE_BUFFER.head++;
+			if(DECODE_BUFFER.head >= DECODE_BUFFER.SIZE)
+				DECODE_BUFFER.head = 0;
+			DECODE_BUFFER.occupancy--;
 
-	  count_dispatches++;
-	  if(count_dispatches >= DECODE_WIDTH)
-	    {
-	      break;
-	    }
+			count_dispatches++;
+			if(count_dispatches >= DECODE_WIDTH)
+				break;
+		}
+		else
+			break;
 	}
-      else
-	{
-	  break;
-	}
-    }
   
-  // make new instructions pay decode penalty if they miss in the decoded instruction cache
-  uint32_t decode_index = DECODE_BUFFER.head;
-  uint32_t count_decodes = 0;
-  for(uint32_t i=0; i<DECODE_BUFFER.SIZE; i++)
-    {
-      if(DECODE_BUFFER.entry[DECODE_BUFFER.head].ip == 0)
+	// make new instructions pay decode penalty if they miss in the decoded instruction cache
+	uint32_t decode_index = DECODE_BUFFER.head;
+	uint32_t count_decodes = 0;
+	for(uint32_t i=0; i<DECODE_BUFFER.SIZE; i++)
 	{
-	  break;
-	}
+		if(DECODE_BUFFER.entry[DECODE_BUFFER.head].ip == 0)
+			break;
       
-      if(DECODE_BUFFER.entry[decode_index].event_cycle == 0)
-	{
-	  // apply decode latency
-	  DECODE_BUFFER.entry[decode_index].event_cycle = current_core_cycle[cpu] + DECODE_LATENCY;
-	}
+		if(DECODE_BUFFER.entry[decode_index].event_cycle == 0)
+		{
+			// apply decode latency
+			DECODE_BUFFER.entry[decode_index].event_cycle = current_core_cycle[cpu] + DECODE_LATENCY;
+		}
       
-      if(decode_index == DECODE_BUFFER.tail)
-	{
-	  break;
-	}
-      decode_index++;
-      if(decode_index >= DECODE_BUFFER.SIZE)
-	{
-	  decode_index = 0;
-	}
+		if(decode_index == DECODE_BUFFER.tail)
+			break;
 
-      count_decodes++;
-      if(count_decodes > DECODE_WIDTH)
-	{
-	  break;
+		decode_index++;
+		if(decode_index >= DECODE_BUFFER.SIZE)
+			decode_index = 0;
+
+		count_decodes++;
+		if(count_decodes > DECODE_WIDTH)
+			break;
 	}
-    }
 }
 
 int O3_CPU::prefetch_code_line(uint64_t ip, uint64_t pf_addr)
@@ -1075,49 +1061,52 @@ void O3_CPU::do_execution(uint32_t rob_index)
 
 void O3_CPU::schedule_memory_instruction()
 {
-    if ((ROB.head == ROB.tail) && ROB.occupancy == 0)
-        return;
+	if ((ROB.head == ROB.tail) && ROB.occupancy == 0)
+		return;
 
-    // execution is out-of-order but we have an in-order scheduling algorithm to detect all RAW dependencies
-    uint32_t limit = ROB.next_schedule;
-    num_searched = 0;
-    if (ROB.head < limit) {
-        for (uint32_t i=ROB.head; i<limit; i++) {
+	// execution is out-of-order but we have an in-order scheduling algorithm to detect all RAW dependencies
+	uint32_t limit = ROB.next_schedule;
+	num_searched = 0;
+	if (ROB.head < limit)
+	{
+		for (uint32_t i=ROB.head; i<limit; i++)
+		{
+			if (ROB.entry[i].is_memory == 0)
+				continue;
 
-            if (ROB.entry[i].is_memory == 0)
-                continue;
+			if ((ROB.entry[i].fetched != COMPLETED) || (ROB.entry[i].event_cycle > current_core_cycle[cpu]) || (num_searched >= SCHEDULER_SIZE))
+				break;
 
-            if ((ROB.entry[i].fetched != COMPLETED) || (ROB.entry[i].event_cycle > current_core_cycle[cpu]) || (num_searched >= SCHEDULER_SIZE))
-                break;
+			if (ROB.entry[i].is_memory && ROB.entry[i].reg_ready && (ROB.entry[i].scheduled == INFLIGHT))
+				do_memory_scheduling(i);
+		}
+	}
+	else
+	{
+		for (uint32_t i=ROB.head; i<ROB.SIZE; i++)
+		{
+			if (ROB.entry[i].is_memory == 0)
+				continue;
 
-            if (ROB.entry[i].is_memory && ROB.entry[i].reg_ready && (ROB.entry[i].scheduled == INFLIGHT))
-                do_memory_scheduling(i);
-        }
-    }
-    else {
-        for (uint32_t i=ROB.head; i<ROB.SIZE; i++) {
+			if ((ROB.entry[i].fetched != COMPLETED) || (ROB.entry[i].event_cycle > current_core_cycle[cpu]) || (num_searched >= SCHEDULER_SIZE))
+				break;
 
-            if (ROB.entry[i].is_memory == 0)
-                continue;
+			if (ROB.entry[i].is_memory && ROB.entry[i].reg_ready && (ROB.entry[i].scheduled == INFLIGHT))
+				do_memory_scheduling(i);
+		}
 
-            if ((ROB.entry[i].fetched != COMPLETED) || (ROB.entry[i].event_cycle > current_core_cycle[cpu]) || (num_searched >= SCHEDULER_SIZE))
-                break;
+		for (uint32_t i=0; i<limit; i++)
+		{
+			if (ROB.entry[i].is_memory == 0)
+				continue;
 
-            if (ROB.entry[i].is_memory && ROB.entry[i].reg_ready && (ROB.entry[i].scheduled == INFLIGHT))
-                do_memory_scheduling(i);
-        }
-        for (uint32_t i=0; i<limit; i++) {
+			if ((ROB.entry[i].fetched != COMPLETED) || (ROB.entry[i].event_cycle > current_core_cycle[cpu]) || (num_searched >= SCHEDULER_SIZE))
+				break;
 
-            if (ROB.entry[i].is_memory == 0)
-                continue;
-
-            if ((ROB.entry[i].fetched != COMPLETED) || (ROB.entry[i].event_cycle > current_core_cycle[cpu]) || (num_searched >= SCHEDULER_SIZE))
-                break;
-
-            if (ROB.entry[i].is_memory && ROB.entry[i].reg_ready && (ROB.entry[i].scheduled == INFLIGHT))
-                do_memory_scheduling(i);
-        }
-    }
+			if (ROB.entry[i].is_memory && ROB.entry[i].reg_ready && (ROB.entry[i].scheduled == INFLIGHT))
+				do_memory_scheduling(i);
+		}
+	}
 }
 
 void O3_CPU::execute_memory_instruction()
@@ -1200,62 +1189,72 @@ uint32_t O3_CPU::check_and_add_lsq(uint32_t rob_index)
 
 void O3_CPU::add_load_queue(uint32_t rob_index, uint32_t data_index)
 {
-    // search for an empty slot 
-    uint32_t lq_index = LQ.SIZE;
-    for (uint32_t i=0; i<LQ.SIZE; i++) {
-        if (LQ.entry[i].virtual_address == 0) {
-            lq_index = i;
-            break;
-        }
-    }
+	// search for an empty slot 
+	uint32_t lq_index = LQ.SIZE;
+	for (uint32_t i=0; i<LQ.SIZE; i++)
+	{
+		if (LQ.entry[i].virtual_address == 0)
+		{
+			lq_index = i;
+			break;
+		}
+	}
 
-    // sanity check
-    if (lq_index == LQ.SIZE) {
-        cerr << "instr_id: " << ROB.entry[rob_index].instr_id << " no empty slot in the load queue!!!" << endl;
-        assert(0);
-    }
+	// sanity check
+	if (lq_index == LQ.SIZE)
+	{
+		cerr << "instr_id: " << ROB.entry[rob_index].instr_id << " no empty slot in the load queue!!!" << endl;
+		assert(0);
+	}
 
-    // add it to the load queue
-    ROB.entry[rob_index].lq_index[data_index] = lq_index;
-    LQ.entry[lq_index].instr_id = ROB.entry[rob_index].instr_id;
-    LQ.entry[lq_index].virtual_address = ROB.entry[rob_index].source_memory[data_index];
-    LQ.entry[lq_index].ip = ROB.entry[rob_index].ip;
-    LQ.entry[lq_index].data_index = data_index;
-    LQ.entry[lq_index].rob_index = rob_index;
-    LQ.entry[lq_index].asid[0] = ROB.entry[rob_index].asid[0];
-    LQ.entry[lq_index].asid[1] = ROB.entry[rob_index].asid[1];
-    LQ.entry[lq_index].event_cycle = current_core_cycle[cpu] + SCHEDULING_LATENCY;
-    LQ.occupancy++;
+	// add it to the load queue
+	ROB.entry[rob_index].lq_index[data_index] = lq_index;
+	LQ.entry[lq_index].instr_id = ROB.entry[rob_index].instr_id;
+	LQ.entry[lq_index].virtual_address = ROB.entry[rob_index].source_memory[data_index];
+	LQ.entry[lq_index].ip = ROB.entry[rob_index].ip;
+	LQ.entry[lq_index].data_index = data_index;
+	LQ.entry[lq_index].rob_index = rob_index;
+	LQ.entry[lq_index].asid[0] = ROB.entry[rob_index].asid[0];
+	LQ.entry[lq_index].asid[1] = ROB.entry[rob_index].asid[1];
+	LQ.entry[lq_index].event_cycle = current_core_cycle[cpu] + SCHEDULING_LATENCY;
+	LQ.occupancy++;
 
-    // check RAW dependency
-    int prior = rob_index - 1;
-    if (prior < 0)
-        prior = ROB.SIZE - 1;
+	// check RAW dependency
+	int prior = rob_index - 1;
+	if (prior < 0)
+		prior = ROB.SIZE - 1;
 
-    if (rob_index != ROB.head) {
-        if ((int)ROB.head <= prior) {
-            for (int i=prior; i>=(int)ROB.head; i--) {
-                if (LQ.entry[lq_index].producer_id != UINT64_MAX)
-                    break;
+	if (rob_index != ROB.head)
+	{
+		if ((int)ROB.head <= prior)
+		{
+			for (int i=prior; i>=(int)ROB.head; i--)
+			{
+				if (LQ.entry[lq_index].producer_id != UINT64_MAX)
+					break;
 
-                    mem_RAW_dependency(i, rob_index, data_index, lq_index);
-            }
-        }
-        else {
-            for (int i=prior; i>=0; i--) {
-                if (LQ.entry[lq_index].producer_id != UINT64_MAX)
-                    break;
+				mem_RAW_dependency(i, rob_index, data_index, lq_index);
+			}
+		}
+		else
+		{
+			for (int i=prior; i>=0; i--)
+			{
+				if (LQ.entry[lq_index].producer_id != UINT64_MAX)
+					break;
 
-                    mem_RAW_dependency(i, rob_index, data_index, lq_index);
-            }
-            for (int i=ROB.SIZE-1; i>=(int)ROB.head; i--) { 
-                if (LQ.entry[lq_index].producer_id != UINT64_MAX)
-                    break;
+				mem_RAW_dependency(i, rob_index, data_index, lq_index);
+			}
 
-                    mem_RAW_dependency(i, rob_index, data_index, lq_index);
-            }
-        }
-    }
+			for (int i=ROB.SIZE-1; i>=(int)ROB.head; i--)
+			{ 
+				if (LQ.entry[lq_index].producer_id != UINT64_MAX)
+					break;
+
+				mem_RAW_dependency(i, rob_index, data_index, lq_index);
+			}
+		}
+	}
 
     // check
     // 1) if store-to-load forwarding is possible
@@ -1845,29 +1844,29 @@ void O3_CPU::update_rob()
 
 void O3_CPU::complete_instr_fetch(PACKET_QUEUE *queue, uint8_t is_it_tlb)
 {
-    uint32_t index = queue->head,
-      rob_index = queue->entry[index].rob_index,
-      num_fetched = 0;
+	uint32_t index = queue->head;
+	uint32_t rob_index = queue->entry[index].rob_index;
+	uint32_t num_fetched = 0;
+	uint64_t complete_ip = queue->entry[index].ip;
 
-    uint64_t complete_ip = queue->entry[index].ip;
-
-    if(is_it_tlb)
-      {
-	uint64_t instruction_physical_address = (queue->entry[index].instruction_pa << LOG2_PAGE_SIZE) | (complete_ip & ((1 << LOG2_PAGE_SIZE) - 1));
+	if(is_it_tlb)
+	{
+		//uint64_t instruction_physical_address = (queue->entry[index].instruction_pa << LOG2_PAGE_SIZE) | (complete_ip & ((1 << LOG2_PAGE_SIZE) - 1));
 	
-	// mark the appropriate instructions in the IFETCH_BUFFER as translated and ready to fetch
-	for(uint32_t j=0; j<IFETCH_BUFFER.SIZE; j++)
-	  {
-	    if(((IFETCH_BUFFER.entry[j].ip)>>LOG2_PAGE_SIZE) == ((complete_ip)>>LOG2_PAGE_SIZE))
+		// mark the appropriate instructions in the IFETCH_BUFFER as translated and ready to fetch
+		for(uint32_t j=0; j<IFETCH_BUFFER.SIZE; j++)
+		{
+			if(((IFETCH_BUFFER.entry[j].ip)>>LOG2_PAGE_SIZE) == ((complete_ip)>>LOG2_PAGE_SIZE))
 	      {
-		IFETCH_BUFFER.entry[j].translated = COMPLETED;
-		// we did not fetch this instruction's cache line, but we did translated it
-		IFETCH_BUFFER.entry[j].fetched = 0;
-		// recalculate a physical address for this cache line based on the translated physical page address
-		uint64_t instr_pa = (queue->entry[index].instruction_pa << LOG2_PAGE_SIZE) | ((IFETCH_BUFFER.entry[j].ip) & ((1 << LOG2_PAGE_SIZE) - 1));
-		IFETCH_BUFFER.entry[j].instruction_pa = instr_pa;
+				IFETCH_BUFFER.entry[j].translated = COMPLETED;
+				// we did not fetch this instruction's cache line, but we did translated it
+				IFETCH_BUFFER.entry[j].fetched = 0;
+				// recalculate a physical address for this cache line based on the translated physical page address
+				uint64_t instr_pa = (queue->entry[index].instruction_pa << LOG2_PAGE_SIZE) | ((IFETCH_BUFFER.entry[j].ip) & ((1 << LOG2_PAGE_SIZE) - 1));
+				IFETCH_BUFFER.entry[j].instruction_pa = instr_pa;
+				printf("Fetching 0x%lx\n", instr_pa);
 	      }
-	  }
+		}
 
 	// remove this entry
 	queue->remove_queue(&queue->entry[index]);
