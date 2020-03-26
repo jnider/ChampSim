@@ -12,40 +12,47 @@ algorithms can be measured.
 #include "wiredtiger.h"
 
 // make WiredTiger global state
-	WT_SESSION *session;
-	char table_name[1024];
+WT_SESSION *session;
+char table_name[1024];
+char rlog_name[] = "output_belady.csv";
+FILE *rlog;
 
 // insert a value
-static void insert(WT_CURSOR *cursor, uint64_t addr, uint64_t timestamp)
+static void insert(WT_CURSOR *cursor, uint64_t vaddr, uint64_t timestamp)
 {
-	char key[24];
-	char value[24];
-
-	snprintf(key, 24, "%lx", addr);
-	snprintf(value, 24, "%lu", timestamp);
-	//printf("Inserting %s %s\n", key, value);
-	cursor->set_key(cursor, key);
-	cursor->set_value(cursor, value);
+	//printf("Inserting va 0x%lx %lu\n", vaddr, timestamp);
+	cursor->set_key(cursor, timestamp);
+	cursor->set_value(cursor, vaddr, timestamp);
 	cursor->insert(cursor);
-	cursor->close(cursor);
 }
 
-static int lookup(WT_CURSOR *cursor, uint64_t addr, uint64_t *timestamp)
+static int lookup(WT_CURSOR *cursor, uint64_t cur_time, uint64_t vaddr, uint64_t *timestamp)
 {
-	char key[24];
-	const char *value;
+	int ret;
+	int exact;
+	uint64_t addr;
 
-	snprintf(key, 24, "%lx", addr);
-    cursor->set_key(cursor, key);
-   int ret = cursor->search(cursor);
-	if (ret < 0)
+	//printf("cur_time: %lu\n", cur_time);
+	if (cur_time == 0)
+		return -1;
+
+	cursor->set_key(cursor, cur_time);
+	ret = cursor->search_near(cursor, &exact);
+	if (ret != 0)
 	{
-		printf("key %s not found\n", key);
+		*timestamp = 0;
 		return -1;
 	}
-    cursor->get_value(cursor, &value);
-	*timestamp = strtoul(value, NULL, 10);
-	return 0;
+
+	while ((ret = cursor->next(cursor)) == 0)
+	{
+		ret = cursor->get_value(cursor, &addr, timestamp);
+		//printf("vaddr: 0x%lx @ %lu\n", vaddr, *timestamp);
+		if (addr == vaddr)
+			return 0;
+	}
+
+	return -1;
 }
 
 // initialize replacement state
@@ -77,13 +84,15 @@ void CACHE::llc_initialize_replacement()
 	}
 
 	// create a table
-	snprintf(table_name, 127, "table:%s", "gamess");
-	int ret = session->create(session, table_name, "key_format=S,value_format=S");
+	snprintf(table_name, 127, "table:%s", "usage");
+	int ret = session->create(session, table_name, "key_format=r,value_format=QQ,columns=(id,vaddr,ts)");
 	if (ret != 0)
 	{
 		printf("error creating session for table %s\n", table_name);
 		return;
 	}
+	/* Create an index with a simple key. */
+	ret = session->create(session, "index:usage:vaddr", "columns=(vaddr)");
 
 	// create a record of all memory accesses in the whole trace for each CPU
 	printf("Skipping %lu warmup instructions\n", ooo_cpu[0].warmup_instructions);
@@ -94,6 +103,11 @@ void CACHE::llc_initialize_replacement()
 		ins++;
 	}
 
+	uint64_t cur_time = ooo_cpu[0].warmup_instructions;
+	//if (session->open_cursor(session, table_name, NULL, "append", &cursor) != 0)
+	if (session->open_cursor(session, table_name, NULL, NULL, &cursor) != 0)
+		printf("Error opening cursor\n");
+	cursor->set_key(cursor, cur_time);
 
 	printf("Loading %lu simulation instructions\n", ooo_cpu[0].simulation_instructions);
 	while (fread(&in, sizeof(in), 1, ooo_cpu[0].trace_file))
@@ -103,19 +117,8 @@ void CACHE::llc_initialize_replacement()
 			if (in.source_memory[s])
 			{
 				//printf("%i:   LOAD <- 0x%lx\n", i, in.source_memory[s]);
-				if (session->open_cursor(session, table_name, NULL, NULL, &cursor) == 0)
-					insert(cursor, in.source_memory[s], ins);
-				else
-					printf("Error inserting\n");
+				insert(cursor, in.source_memory[s], ins);
 				loads++;
-/*
-				if (session->open_cursor(session, table_name, NULL, NULL, &cursor) == 0)
-				{
-					uint64_t ts;
-					if (lookup(cursor, in.source_memory[s], &ts) == 0)
-						printf("Found %lx at %lu\n", in.source_memory[s], ts); 
-				}
-*/
 			}
 		}
 
@@ -124,12 +127,6 @@ void CACHE::llc_initialize_replacement()
 			if (in.destination_memory[d])
 			{
 				//printf("%i:   STORE -> 0x%lx\n", i, in.destination_memory[d]);
-				ret = session->open_cursor(session, table_name, NULL, NULL, &cursor);
-				if (ret != 0)
-				{
-					printf("Error opening cursor during insert\n");
-					return;
-				}
 				insert(cursor, in.destination_memory[d], ins);
 				stores++;
 			}
@@ -140,11 +137,30 @@ void CACHE::llc_initialize_replacement()
 
 		ins++;
 	}
+	cursor->close(cursor);
+
+/*
+	// dump the contents
+	uint64_t vaddr, ts, recno;
+	if (session->open_cursor(session, table_name, NULL, NULL, &cursor) != 0)
+		printf("Error opening cursor 2\n");
+	while ((ret = cursor->next(cursor)) == 0)
+	{
+		cursor->get_key(cursor, &recno);
+		ret = cursor->get_value(cursor, &vaddr, &ts);
+		printf("%lu: 0x%lx @ %lu\n", recno, vaddr, ts);
+	}
+	ret = cursor->close(cursor);
+*/
 
 	// rewind the file pointer
 	fseek(ooo_cpu[0].trace_file, 0L, SEEK_SET);
 
 	printf("Saw %lu loads and %lu stores\n", loads, stores);
+
+	// open the replacement log
+	rlog = fopen(rlog_name, "wt");
+	fprintf(rlog, "cpu, instr_id, set, way, timestamp, address, ip, type\n");
 }
 
 // find replacement victim
@@ -157,45 +173,56 @@ uint32_t CACHE::llc_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set,
 	uint64_t timestamp;
 	uint64_t best_timestamp = 0;
 
-	// baseline LRU
-	//return lru_victim(cpu, instr_id, set, current_set, ip, full_addr, type); 
-
 	// check for invalid sets first
 	for (way=0; way<NUM_WAY; way++)
 	{
 		if (block[set][way].valid == false)
-			return way;
+		{
+			best_way = way;
+			goto done;
+		}
 	}
 
+	// look up the next time to use
+	if (session->open_cursor(session, table_name, NULL, NULL, &cursor) != 0)
+	{
+		printf("Error opening cursor during insert\n");
+		return 0;
+	}
 
-	printf("What are my options:\n");
+	// find the timestamp that is furthest in the future
 	for (way=0; way<NUM_WAY; way++)
 	{
-		printf("Full Address=%lx address=%lx\n", block[set][way].full_addr, block[set][way].address);
-		uint64_t addr = block[set][way].address;
+		uint64_t paddr = block[set][way].full_addr;
 
-		// look up the next time to use
-		if (session->open_cursor(session, table_name, NULL, NULL, &cursor) != 0)
+		// translate phys to virt
+		uint64_t vaddr = pa_to_va(cpu, paddr);
+
+
+		// if it is not in the database, it is never reused - replace it!
+		if (lookup(cursor, instr_id, vaddr, &timestamp) == -1)
 		{
-			printf("Error opening cursor during insert\n");
-			return 0;
+			best_way = way;
+			//printf("Next use for 0x%lx=never!\n", vaddr);
+			break;
 		}
-		printf("Looking up %i = 0x%lx\n", way, addr);
-		fflush(stdout);
+		//printf("[%i] 0x%lx=%lu\n", way, vaddr, timestamp);
 
-		// if it is not in the database, it is never reused
-		if (lookup(cursor, addr, &timestamp) == -1)
-			return way;
-
-		printf("Way %i = 0x%lx @ %lu\n", way, addr, timestamp);
 		if (timestamp > best_timestamp)
 		{
 			best_timestamp = timestamp;
 			best_way = way;
 		}
 	}
+	cursor->close(cursor);
 
-	printf("Replacing %i @ %lu\n", best_way, best_timestamp);
+	//printf("Replacing %i @ %lu\n", best_way, best_timestamp);
+
+done:
+	// log it
+	fprintf(rlog, "%u,0x%lx,%u,0x%x,0x%lx,0x%lx,0x%lx,%u\n",
+		cpu, instr_id, set, best_way,
+		best_timestamp, full_addr, ip, type);
 	return best_way;
 }
 
@@ -203,37 +230,12 @@ uint32_t CACHE::llc_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set,
 void CACHE::llc_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way,
 	uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit)
 {
-	string TYPE_NAME;
-	if (type == LOAD)
-		TYPE_NAME = "LOAD";
-	else if (type == RFO)
-		TYPE_NAME = "RFO";
-	else if (type == PREFETCH)
-		TYPE_NAME = "PF";
-	else if (type == WRITEBACK)
-		TYPE_NAME = "WB";
-	else
-	assert(0);
-
-	if (hit)
-		TYPE_NAME += "_HIT";
-	else
-		TYPE_NAME += "_MISS";
-
-	if ((type == WRITEBACK) && ip)
-		assert(0);
-
-    // uncomment this line to see the LLC accesses
-    // cout << "CPU: " << cpu << "  LLC " << setw(9) << TYPE_NAME << " set: " << setw(5) << set << " way: " << setw(2) << way;
-    // cout << hex << " paddr: " << setw(12) << paddr << " ip: " << setw(8) << ip << " victim_addr: " << victim_addr << dec << endl;
-
-	// baseline LRU
-	if (hit && (type == WRITEBACK)) // writeback hit does not update LRU state
-		return;
-
-	return lru_update(set, way);
+	//if (hit)
+	//	printf("Hit: 0x%lx\n", full_addr);
 }
 
 void CACHE::llc_replacement_final_stats()
 {
+	printf("Closing rlog file\n");
+	fclose(rlog);
 }

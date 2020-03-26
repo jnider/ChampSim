@@ -335,7 +335,7 @@ uint64_t va_to_pa(uint32_t cpu, uint64_t instr_id, uint64_t va, uint64_t unique_
             // here, ChampSim randomly selects a page that is not recently used and we only track 32K recently accessed pages
             uint8_t  found_NRU = 0;
             uint64_t NRU_vpage = 0; // implement it
-            map <uint64_t, uint64_t>::iterator pr2 = recent_page.begin();
+            //map <uint64_t, uint64_t>::iterator pr2 = recent_page.begin();
             for (pr = page_table.begin(); pr != page_table.end(); pr++) {
 
                 NRU_vpage = pr->first;
@@ -479,6 +479,23 @@ uint64_t va_to_pa(uint32_t cpu, uint64_t instr_id, uint64_t va, uint64_t unique_
     //cout << "cpu: " << cpu << " allocated unique_vpage: " << hex << unique_vpage << " to ppage: " << ppage << dec << endl;
 
     return pa;
+}
+
+uint64_t pa_to_va(uint32_t cpu, uint64_t pa)
+{
+	uint64_t va, ppage;
+
+	ppage = pa >> LOG2_PAGE_SIZE;
+	//printf("Looking up PA 0x%lx (page=0x%lx)\n", pa, ppage);
+	map <uint64_t, uint64_t>::iterator pair;
+	pair = inverse_table.find(ppage);
+	if (pair == inverse_table.end())
+		va = 0;
+	else
+		va = pair->second << LOG2_PAGE_SIZE | (pa & ((1<<LOG2_PAGE_SIZE)-1));
+	//if (va)
+	//	printf("Found va=0x%lx\n", va);
+	return va;
 }
 
 int main(int argc, char** argv)
@@ -791,10 +808,8 @@ int main(int argc, char** argv)
 	      ooo_cpu[i].update_rob();
 
 	      // decode
-	      if(ooo_cpu[i].DECODE_BUFFER.occupancy > 0)
-		{
-		  ooo_cpu[i].decode_and_dispatch();
-		}
+			if(ooo_cpu[i].DECODE_BUFFER.occupancy > 0)
+				ooo_cpu[i].decode_and_dispatch();
 	      
 	      // fetch
 	      ooo_cpu[i].fetch_instruction();
