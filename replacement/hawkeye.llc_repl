@@ -18,6 +18,9 @@ uint32_t rrip[LLC_SETS][LLC_WAYS];
 #include "optgen.h"
 #include "helper_function.h"
 
+char rlog_name[] = "output_hawkeye.csv";
+FILE *rlog;
+
 //Hawkeye predictors for demand and prefetch requests
 Hawkeye_Predictor* predictor_demand;    //2K entries, 5-bit counter per each entry
 Hawkeye_Predictor* predictor_prefetch;  //2K entries, 5-bit counter per each entry
@@ -68,6 +71,10 @@ void CACHE::llc_initialize_replacement()
     predictor_demand = new Hawkeye_Predictor();
 
     cout << "Finished initializing Hawkeye replacement policy state" << endl;
+
+	// open the replacement log
+	rlog = fopen(rlog_name, "wt");
+	fprintf(rlog, "cpu, instr_id, set, way, timestamp, address, ip, type\n");
 }
 
 // Find replacement victim
@@ -75,16 +82,18 @@ void CACHE::llc_initialize_replacement()
 // uint32_t GetVictimInSet (uint32_t cpu, uint32_t set, const BLOCK *current_set, uint64_t PC, uint64_t paddr, uint32_t type)
 uint32_t CACHE::llc_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, const BLOCK *current_set, uint64_t ip, uint64_t full_addr, uint32_t type)
 {
+    int32_t victim = -1;
+    uint32_t max_rrpv = 0;
+
     //Find the line with RRPV of 7 in that set
     for(uint32_t i = 0; i < LLC_WAYS; i++){
         if(rrip[set][i] == MAXRRIP){
-            return i;
+            victim = i;
+				goto done;
         }
     }
 
     //If no RRPV of 7, then we find next highest RRPV value (oldest cache-friendly line)
-    uint32_t max_rrpv = 0;
-    int32_t victim = -1;
     for(uint32_t i = 0; i < LLC_WAYS; i++){
         if(rrip[set][i] >= max_rrpv){
             max_rrpv = rrip[set][i];
@@ -103,6 +112,10 @@ uint32_t CACHE::llc_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, c
         }
     }
 
+done:
+					fprintf(rlog, "%u,0x%lx,%u,0x%x,0x%lx,0x%lx,0x%lx,%u\n",
+						cpu, instr_id, set, victim,
+						instr_id, full_addr, ip, type);
     return victim;
 }
 
@@ -297,4 +310,6 @@ void CACHE::llc_replacement_final_stats()
     cout<< "Final OPTGen Access: " << access << endl;
     cout<< "Final OPTGEN Hit Rate: " << 100 * ( (double)hits/(double)access )<< endl;
 
+	printf("Closing rlog file\n");
+	fclose(rlog);
 }
