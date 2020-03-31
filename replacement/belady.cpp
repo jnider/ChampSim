@@ -9,47 +9,221 @@ algorithms can be measured.
 
 #include "cache.h"
 #include "ooo_cpu.h"
-#include "wiredtiger.h"
 
-// make WiredTiger global state
-WT_SESSION *session;
-char table_name[1024];
+unsigned long mem_used;
+
+#ifdef LOGGING
 char rlog_name[] = "output_belady.csv";
 FILE *rlog;
+#endif // LOGGING
+
+// use a radix tree for sparse lookups (va->next usage)
+// 64-bit virtual address -> 64 byte cache line (drop 6 bits)
+// Use: l1:10 bits l2:16 bits l3:16 bits l4:16 bits
+#define RL1_BITS 16
+#define RL2_BITS 16
+#define RL3_BITS 16
+#define RL4_BITS 16
+
+#define RL1_ENTRIES (2<<RL1_BITS)
+#define RL2_ENTRIES (2<<RL2_BITS)
+#define RL3_ENTRIES (2<<RL3_BITS)
+#define RL4_ENTRIES (2<<RL4_BITS)
+
+struct timestamp_array
+{
+	uint32_t used; // how many data elements are filled
+	uint32_t alloc; // how many data elements are allocated
+	uint64_t start; // which data element is 'next'
+	uint64_t *data; // the data
+};
+
+uint64_t* rtable[RL1_ENTRIES];
 
 // insert a value
-static void insert(WT_CURSOR *cursor, uint64_t vaddr, uint64_t timestamp)
+static void insert(uint64_t vaddr, uint64_t timestamp)
 {
 	//printf("Inserting va 0x%lx %lu\n", vaddr, timestamp);
-	cursor->set_key(cursor, timestamp);
-	cursor->set_value(cursor, vaddr, timestamp);
-	cursor->insert(cursor);
-}
 
-static int lookup(WT_CURSOR *cursor, uint64_t cur_time, uint64_t vaddr, uint64_t *timestamp)
-{
-	int ret;
-	int exact;
-	uint64_t addr;
+	long unsigned int rl1_index = (vaddr & 0xFFFF000000000000) >> (64-RL1_BITS);
+	long unsigned int rl2_index = (vaddr & 0x0000FFFF00000000) >> (64-RL1_BITS-RL2_BITS);
+	long unsigned int rl3_index = (vaddr & 0x00000000FFFF0000) >> (64-RL1_BITS-RL2_BITS-RL3_BITS);
+	long unsigned int rl4_index = (vaddr & 0x000000000000FFC0) >> (64-RL1_BITS-RL2_BITS-RL3_BITS-RL4_BITS);
 
-	//printf("cur_time: %lu\n", cur_time);
-	if (cur_time == 0)
-		return -1;
+	//printf("rl1_index = 0x%lx\n", rl1_index);
+	//printf("rl2_index = 0x%lx\n", rl2_index);
+	//printf("rl3_index = 0x%lx\n", rl3_index);
+	//printf("rl4_index = 0x%lx\n", rl4_index);
 
-	cursor->set_key(cursor, cur_time);
-	ret = cursor->search_near(cursor, &exact);
-	if (ret != 0)
+	uint64_t* rl2_table = rtable[rl1_index];
+	if (!rl2_table)
 	{
-		*timestamp = 0;
-		return -1;
+		//printf("No RL2 entry for 0x%lx - creating\n", rl1_index << (64-RL1_BITS));
+		rl2_table = (uint64_t*)calloc(RL2_ENTRIES, sizeof(uint64_t*));
+		rtable[rl1_index] = rl2_table;
+		mem_used += RL2_ENTRIES * sizeof(uint64_t*);
 	}
 
-	while ((ret = cursor->next(cursor)) == 0)
+	// level 3
+	uint64_t* rl3_table = (uint64_t*)rl2_table[rl2_index];
+	if (!rl3_table)
 	{
-		ret = cursor->get_value(cursor, &addr, timestamp);
-		//printf("vaddr: 0x%lx @ %lu\n", vaddr, *timestamp);
-		if (addr == vaddr)
+		//printf("No entry for RL3 0x%lx - creating\n", rl2_index << (64-RL1_BITS-RL2_BITS));
+		rl3_table = (uint64_t*)calloc(RL3_ENTRIES, sizeof(uint64_t*));
+		rl2_table[rl2_index] = (uint64_t)rl3_table;
+		mem_used += RL3_ENTRIES * sizeof(uint64_t*);
+	}
+
+	// level 4
+	timestamp_array** rl4_table = (timestamp_array**)rl3_table[rl3_index];
+	if (!rl4_table)
+	{
+		//printf("No entry for RL4 0x%lx - creating\n", rl3_index << (64-RL1_BITS-RL2_BITS-RL3_BITS));
+		rl4_table = (timestamp_array**)calloc(RL4_ENTRIES, sizeof(uint64_t*));
+		rl3_table[rl3_index] = (uint64_t)rl4_table;
+		mem_used += RL4_ENTRIES * sizeof(uint64_t*);
+	}
+
+	// array of timestamps
+	timestamp_array *tsarray = rl4_table[rl4_index];
+	if (!tsarray)
+	{
+		//printf("No array for 0x%lx - creating\n", vaddr);
+		tsarray = (timestamp_array *)malloc(sizeof(struct timestamp_array));
+		mem_used += sizeof(struct timestamp_array);
+		rl4_table[rl4_index] = tsarray;
+		tsarray->data = (uint64_t*)calloc(4, sizeof(uint64_t));
+		tsarray->alloc = 4; // number of entries allocated in the array
+		tsarray->used = 0;
+		tsarray->start = 0;
+		mem_used += 4 * sizeof(uint64_t);
+	}
+
+/*
+	if (vaddr == 0x6dddc8)
+	{
+		printf("Dumping 0x%lx at %lu\n", vaddr, timestamp);
+		for (unsigned int i=0; i < tsarray->used; i++)
+			printf(" [%u]: %lu\n", i, tsarray->data[i]);
+	}
+*/
+
+	if (tsarray->used == tsarray->alloc)
+	{
+		unsigned int newsize = tsarray->alloc * 2;
+		//printf("reallocating to %u for 0x%lx\n", newsize, vaddr);
+		tsarray->data = (uint64_t*)reallocarray(tsarray->data, newsize, sizeof(uint64_t));
+		mem_used += tsarray->alloc * sizeof(uint64_t);
+		tsarray->alloc = newsize;
+	}
+
+	//printf("inserting timestamp\n");
+	tsarray->data[tsarray->used++] = timestamp;
+	//printf("Done\n");
+
+}
+
+static int lookup(uint64_t cur_time, uint64_t vaddr, uint64_t *timestamp)
+{
+	*timestamp = 0;
+
+	//if (cur_time == 0)
+	//	return -1;
+
+	//printf("Looking up 0x%lx after time %lu\n", vaddr, cur_time);
+
+	long unsigned int rl1_index = (vaddr & 0xFFFF000000000000) >> (64-RL1_BITS);
+	long unsigned int rl2_index = (vaddr & 0x0000FFFF00000000) >> (64-RL1_BITS-RL2_BITS);
+	long unsigned int rl3_index = (vaddr & 0x00000000FFFF0000) >> (64-RL1_BITS-RL2_BITS-RL3_BITS);
+	long unsigned int rl4_index = (vaddr & 0x000000000000FFC0) >> (64-RL1_BITS-RL2_BITS-RL3_BITS-RL4_BITS);
+
+	//printf("rl1_index = 0x%lx\n", rl1_index);
+	//printf("rl2_index = 0x%lx\n", rl2_index);
+	//printf("rl3_index = 0x%lx\n", rl3_index);
+	//printf("rl4_index = 0x%lx\n", rl4_index);
+
+	uint64_t* rl2_table = rtable[rl1_index];
+	if (!rl2_table)
+	{
+		//printf("No RL2 table\n");
+		return -2;
+	}
+
+	uint64_t* rl3_table = (uint64_t*)rl2_table[rl2_index];
+	if (!rl3_table)
+	{
+		//printf("No RL3 table\n");
+		return -3;
+	}
+
+	timestamp_array** rl4_table = (timestamp_array**)rl3_table[rl3_index];
+	if (!rl4_table)
+	{
+		//printf("No RL4 table\n");
+		return -4;
+	}
+
+	timestamp_array *tsarray = rl4_table[rl4_index];
+	if (!tsarray)
+	{
+		//printf("No tsarray\n");
+		return -5;
+	}
+
+/*
+	for (unsigned int i=0; i < tsarray->used; i++)
+	{
+		if (tsarray->data[i] > cur_time)
+		{
+			*timestamp = tsarray->data[i];
 			return 0;
+		}
+	}
+*/
+	if (tsarray->start < tsarray->used)
+	{
+		unsigned int i = tsarray->start;
+		*timestamp = tsarray->data[i];
+		//printf("Addr: 0x%lx next use @ %lu\n", vaddr, *timestamp);
+		return 0;
+	}
+
+	return -1;
+}
+
+static int update(uint64_t vaddr)
+{
+	if (vaddr == 0)
+		return 0;
+
+	//printf("Update 0x%lx\n", vaddr);
+
+	long unsigned int rl1_index = (vaddr & 0xFFFF000000000000) >> (64-RL1_BITS);
+	long unsigned int rl2_index = (vaddr & 0x0000FFFF00000000) >> (64-RL1_BITS-RL2_BITS);
+	long unsigned int rl3_index = (vaddr & 0x00000000FFFF0000) >> (64-RL1_BITS-RL2_BITS-RL3_BITS);
+	long unsigned int rl4_index = (vaddr & 0x000000000000FFC0) >> (64-RL1_BITS-RL2_BITS-RL3_BITS-RL4_BITS);
+
+	uint64_t* rl2_table = rtable[rl1_index];
+	if (!rl2_table)
+		return -2;
+
+	uint64_t* rl3_table = (uint64_t*)rl2_table[rl2_index];
+	if (!rl3_table)
+		return -3;
+
+	timestamp_array** rl4_table = (timestamp_array**)rl3_table[rl3_index];
+	if (!rl4_table)
+		return -4;
+
+	timestamp_array *tsarray = rl4_table[rl4_index];
+	if (!tsarray)
+		return -5;
+
+	if (tsarray->start < tsarray->used)
+	{
+		printf("Addr: 0x%lx was: %lu next: %lu\n", vaddr, tsarray->data[tsarray->start], tsarray->data[tsarray->start + 1]);
+		tsarray->start++;
+		return 0;
 	}
 
 	return -1;
@@ -63,37 +237,6 @@ void CACHE::llc_initialize_replacement()
 	long unsigned int loads=0;
 	long unsigned int stores=0;
 
-	WT_CONNECTION *conn;
-	WT_CURSOR *cursor;
-
-	char home[] = "/home/joel/projects/ChampSim/db";
-
-	/* Open a connection to the database, creating it if necessary. */
-	printf("Opening db at %s\n", home);
-	if (wiredtiger_open(home, NULL, "create", &conn) != 0)
-	{
-		printf("Error opening db\n");
-		return;
-	}
-
-	printf("Opening session\n");
-	if (conn->open_session(conn, NULL, NULL, &session) != 0)
-	{
-		printf("Error opening session\n");
-		return;
-	}
-
-	// create a table
-	snprintf(table_name, 127, "table:%s", "usage");
-	int ret = session->create(session, table_name, "key_format=r,value_format=QQ,columns=(id,vaddr,ts)");
-	if (ret != 0)
-	{
-		printf("error creating session for table %s\n", table_name);
-		return;
-	}
-	/* Create an index with a simple key. */
-	ret = session->create(session, "index:usage:vaddr", "columns=(vaddr)");
-
 	// create a record of all memory accesses in the whole trace for each CPU
 	printf("Skipping %lu warmup instructions\n", ooo_cpu[0].warmup_instructions);
 	while (fread(&in, sizeof(in), 1, ooo_cpu[0].trace_file))
@@ -103,11 +246,7 @@ void CACHE::llc_initialize_replacement()
 		ins++;
 	}
 
-	uint64_t cur_time = ooo_cpu[0].warmup_instructions;
-	//if (session->open_cursor(session, table_name, NULL, "append", &cursor) != 0)
-	if (session->open_cursor(session, table_name, NULL, NULL, &cursor) != 0)
-		printf("Error opening cursor\n");
-	cursor->set_key(cursor, cur_time);
+	//uint64_t cur_time = ooo_cpu[0].warmup_instructions;
 
 	printf("Loading %lu simulation instructions\n", ooo_cpu[0].simulation_instructions);
 	while (fread(&in, sizeof(in), 1, ooo_cpu[0].trace_file))
@@ -117,8 +256,9 @@ void CACHE::llc_initialize_replacement()
 			if (in.source_memory[s])
 			{
 				//printf("%i:   LOAD <- 0x%lx\n", i, in.source_memory[s]);
-				insert(cursor, in.source_memory[s], ins);
+				insert(in.source_memory[s], ins);
 				loads++;
+				//lookup(0, in.source_memory[s], &ts);
 			}
 		}
 
@@ -127,8 +267,9 @@ void CACHE::llc_initialize_replacement()
 			if (in.destination_memory[d])
 			{
 				//printf("%i:   STORE -> 0x%lx\n", i, in.destination_memory[d]);
-				insert(cursor, in.destination_memory[d], ins);
+				insert(in.destination_memory[d], ins);
 				stores++;
+				//lookup(0, in.destination_memory[d], &ts);
 			}
 		}
 
@@ -137,30 +278,22 @@ void CACHE::llc_initialize_replacement()
 
 		ins++;
 	}
-	cursor->close(cursor);
 
 /*
 	// dump the contents
-	uint64_t vaddr, ts, recno;
-	if (session->open_cursor(session, table_name, NULL, NULL, &cursor) != 0)
-		printf("Error opening cursor 2\n");
-	while ((ret = cursor->next(cursor)) == 0)
-	{
-		cursor->get_key(cursor, &recno);
-		ret = cursor->get_value(cursor, &vaddr, &ts);
-		printf("%lu: 0x%lx @ %lu\n", recno, vaddr, ts);
-	}
-	ret = cursor->close(cursor);
 */
 
 	// rewind the file pointer
 	fseek(ooo_cpu[0].trace_file, 0L, SEEK_SET);
 
 	printf("Saw %lu loads and %lu stores\n", loads, stores);
+	printf("Mem used: %lu\n", mem_used);
 
+#ifdef LOGGING
 	// open the replacement log
 	rlog = fopen(rlog_name, "wt");
 	fprintf(rlog, "cpu, instr_id, set, way, timestamp, address, ip, type\n");
+#endif // LOGGING
 }
 
 // find replacement victim
@@ -169,60 +302,62 @@ uint32_t CACHE::llc_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set,
 {
 	uint32_t way = 0;
 	uint32_t best_way = 0;
-	WT_CURSOR *cursor;
-	uint64_t timestamp;
+	uint64_t timestamp = 0;
 	uint64_t best_timestamp = 0;
+	uint64_t best_vaddr = 0;
+
+	//printf("Current time: %lu\n", instr_id);
+	//printf("Physical address: 0x%lx -> set: 0x%x\n", full_addr, set);
 
 	// check for invalid sets first
 	for (way=0; way<NUM_WAY; way++)
 	{
-		if (block[set][way].valid == false)
+		//if (block[set][way].valid == false)
+		if (current_set[way].valid == false)
 		{
 			best_way = way;
 			goto done;
 		}
 	}
 
-	// look up the next time to use
-	if (session->open_cursor(session, table_name, NULL, NULL, &cursor) != 0)
-	{
-		printf("Error opening cursor during insert\n");
-		return 0;
-	}
-
 	// find the timestamp that is furthest in the future
 	for (way=0; way<NUM_WAY; way++)
 	{
-		uint64_t paddr = block[set][way].full_addr;
+		uint64_t paddr = current_set[way].full_addr;
 
 		// translate phys to virt
 		uint64_t vaddr = pa_to_va(cpu, paddr);
 
-
 		// if it is not in the database, it is never reused - replace it!
-		if (lookup(cursor, instr_id, vaddr, &timestamp) == -1)
+		if (lookup(instr_id, vaddr, &timestamp) < 0)
 		{
 			best_way = way;
-			//printf("Next use for 0x%lx=never!\n", vaddr);
+			best_timestamp = instr_id;
+			best_vaddr = vaddr;
+			printf("[%i] 0x%lx=X\n", way, vaddr);
 			break;
 		}
-		//printf("[%i] 0x%lx=%lu\n", way, vaddr, timestamp);
+
+		printf("[%i] 0x%lx=%lu\n", way, vaddr, timestamp);
 
 		if (timestamp > best_timestamp)
 		{
 			best_timestamp = timestamp;
 			best_way = way;
+			best_vaddr = vaddr;
 		}
 	}
-	cursor->close(cursor);
 
-	//printf("Replacing %i @ %lu\n", best_way, best_timestamp);
+	printf("Installing 0x%lx in [0x%x][%i]\n", full_addr, set, best_way);
+	update(best_vaddr);
 
 done:
+#ifdef LOGGING
 	// log it
 	fprintf(rlog, "%u,0x%lx,%u,0x%x,0x%lx,0x%lx,0x%lx,%u\n",
 		cpu, instr_id, set, best_way,
 		best_timestamp, full_addr, ip, type);
+#endif // LOGGING
 	return best_way;
 }
 
@@ -236,6 +371,8 @@ void CACHE::llc_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
 
 void CACHE::llc_replacement_final_stats()
 {
+#ifdef LOGGING
 	printf("Closing rlog file\n");
 	fclose(rlog);
+#endif // LOGGING
 }
