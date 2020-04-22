@@ -48,12 +48,12 @@ void CACHE::llc_initialize_replacement()
         //printf("rand_sets[%d]: %d\n", i, rand_sets[i]);
     }
 
-    for (int i=0; i<NUM_CPUS; i++)
-        PSEL[i] = 0;
+	for (int i=0; i<NUM_CPUS; i++)
+		PSEL[i] = 0;
 
 	// open the replacement log
 	rlog = fopen(rlog_name, "wt");
-	fprintf(rlog, "cpu, instr_id, set, way, timestamp, address, ip, type\n");
+	fprintf(rlog, "cpu, instr_id, set, way, timestamp, address, ip, type, hit\n");
 }
 
 int is_it_leader(uint32_t cpu, uint32_t set)
@@ -71,6 +71,10 @@ int is_it_leader(uint32_t cpu, uint32_t set)
 // called on every cache hit and cache fill
 void CACHE::llc_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t way, uint64_t full_addr, uint64_t ip, uint64_t victim_addr, uint32_t type, uint8_t hit)
 {
+					fprintf(rlog, "%u,0x%lx,%u,0x%x,0x%lx,0x%lx,0x%lx,%u,%u\n",
+						cpu, 0UL, set, way,
+						0UL, full_addr, ip, type, hit);
+
     // do not update replacement state for writebacks
     if (type == WRITEBACK) {
         rrpv[set][way] = maxRRPV-1;
@@ -124,9 +128,9 @@ uint32_t CACHE::llc_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set, c
             if (rrpv[set][i] == maxRRPV)
 				{
 					// log it
-					fprintf(rlog, "%u,0x%lx,%u,0x%x,0x%lx,0x%lx,0x%lx,%u\n",
+					fprintf(rlog, "%u,0x%lx,%u,0x%x,0x%lx,0x%lx,0x%lx,%u,%u\n",
 						cpu, instr_id, set, i,
-						instr_id, full_addr, ip, type);
+						instr_id, full_addr, ip, type, 99);
                 return i;
 				}
 
