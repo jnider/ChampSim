@@ -12,6 +12,8 @@ algorithms can be measured.
 
 unsigned long mem_used;
 
+#define LOGGING
+
 #ifdef LOGGING
 char rlog_name[] = "output_belady.csv";
 FILE *rlog;
@@ -99,15 +101,6 @@ static void insert(uint64_t vaddr, uint64_t timestamp)
 		mem_used += 4 * sizeof(uint64_t);
 	}
 
-/*
-	if (vaddr == 0x6dddc8)
-	{
-		printf("Dumping 0x%lx at %lu\n", vaddr, timestamp);
-		for (unsigned int i=0; i < tsarray->used; i++)
-			printf(" [%u]: %lu\n", i, tsarray->data[i]);
-	}
-*/
-
 	if (tsarray->used == tsarray->alloc)
 	{
 		unsigned int newsize = tsarray->alloc * 2;
@@ -170,16 +163,6 @@ static int lookup(uint64_t cur_time, uint64_t vaddr, uint64_t *timestamp)
 		return -5;
 	}
 
-/*
-	for (unsigned int i=0; i < tsarray->used; i++)
-	{
-		if (tsarray->data[i] > cur_time)
-		{
-			*timestamp = tsarray->data[i];
-			return 0;
-		}
-	}
-*/
 	if (tsarray->start < tsarray->used)
 	{
 		unsigned int i = tsarray->start;
@@ -221,7 +204,7 @@ static int update(uint64_t vaddr)
 
 	if (tsarray->start < tsarray->used)
 	{
-		printf("Addr: 0x%lx was: %lu next: %lu\n", vaddr, tsarray->data[tsarray->start], tsarray->data[tsarray->start + 1]);
+		//printf("Addr: 0x%lx was: %lu next: %lu\n", vaddr, tsarray->data[tsarray->start], tsarray->data[tsarray->start + 1]);
 		tsarray->start++;
 		return 0;
 	}
@@ -279,10 +262,6 @@ void CACHE::llc_initialize_replacement()
 		ins++;
 	}
 
-/*
-	// dump the contents
-*/
-
 	// rewind the file pointer
 	fseek(ooo_cpu[0].trace_file, 0L, SEEK_SET);
 
@@ -292,7 +271,7 @@ void CACHE::llc_initialize_replacement()
 #ifdef LOGGING
 	// open the replacement log
 	rlog = fopen(rlog_name, "wt");
-	fprintf(rlog, "cpu, instr_id, set, way, timestamp, address, ip, type\n");
+	fprintf(rlog, "cpu, instr_id, set, way, timestamp, address, ip, type, hit\n");
 #endif // LOGGING
 }
 
@@ -334,11 +313,11 @@ uint32_t CACHE::llc_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set,
 			best_way = way;
 			best_timestamp = instr_id;
 			best_vaddr = vaddr;
-			printf("[%i] 0x%lx=X\n", way, vaddr);
+			//printf("[%i] 0x%lx=X\n", way, vaddr);
 			break;
 		}
 
-		printf("[%i] 0x%lx=%lu\n", way, vaddr, timestamp);
+		//printf("[%i] 0x%lx=%lu\n", way, vaddr, timestamp);
 
 		if (timestamp > best_timestamp)
 		{
@@ -348,15 +327,15 @@ uint32_t CACHE::llc_find_victim(uint32_t cpu, uint64_t instr_id, uint32_t set,
 		}
 	}
 
-	printf("Installing 0x%lx in [0x%x][%i]\n", full_addr, set, best_way);
+	//printf("Installing 0x%lx in [0x%x][%i]\n", full_addr, set, best_way);
 	update(best_vaddr);
 
 done:
 #ifdef LOGGING
 	// log it
-	fprintf(rlog, "%u,0x%lx,%u,0x%x,0x%lx,0x%lx,0x%lx,%u\n",
+	fprintf(rlog, "%u,0x%lx,%u,0x%x,0x%lx,0x%lx,0x%lx,%u,%u\n",
 		cpu, instr_id, set, best_way,
-		best_timestamp, full_addr, ip, type);
+		best_timestamp, full_addr, ip, type, 99);
 #endif // LOGGING
 	return best_way;
 }
@@ -367,6 +346,12 @@ void CACHE::llc_update_replacement_state(uint32_t cpu, uint32_t set, uint32_t wa
 {
 	//if (hit)
 	//	printf("Hit: 0x%lx\n", full_addr);
+#ifdef LOGGING
+	// log it
+	fprintf(rlog, "%u,0x%lx,%u,0x%x,0x%lx,0x%lx,0x%lx,%u,%u\n",
+		cpu, 0UL, set, way,
+		0UL, full_addr, ip, type, hit);
+#endif // LOGGING
 }
 
 void CACHE::llc_replacement_final_stats()
